@@ -4,6 +4,7 @@ import numpy as np
 import requests
 import json
 from datetime import datetime, timedelta
+import yfinance as yf
 import plotly.graph_objects as go
 
 # Cấu hình giao diện Streamlit
@@ -25,57 +26,75 @@ if not api_key:
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
 
 # ----------------------------------------------------
-# 2. DATA ENGINE VỚI CACHE & FAILOVER
+# 2. DATA ENGINE: GLOBAL-COMPATIBLE INGESTION
 # ----------------------------------------------------
+def fetch_from_yahoo(sym: str):
+    """Lấy dữ liệu quốc tế qua Yahoo Finance (Bypass 100% lỗi Geo-block của Cloud)"""
+    try:
+        ticker = f"{sym}.VN"
+        stock = yf.Ticker(ticker)
+        # Lấy lịch sử 6 tháng gần nhất
+        df = stock.history(period="6mo", interval="1d")
+        
+        if df is not None and not df.empty and len(df) >= 20:
+            df = df.reset_index()
+            # Chuẩn hóa tên cột
+            df = df.rename(columns={
+                "Date": "date",
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Volume": "volume"
+            })
+            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+            return df[["date", "open", "high", "low", "close", "volume"]]
+    except Exception:
+        pass
+    return None
+
+def fetch_from_entrade_backup(sym: str):
+    """Nguồn dự phòng phụ qua Entrade Chart API"""
+    try:
+        end_ts = int(datetime.now().timestamp())
+        start_ts = int((datetime.now() - timedelta(days=180)).timestamp())
+        url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?from={start_ts}&to={end_ts}&symbol={sym}&resolution=D"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, timeout=5).json()
+        if "t" in res and len(res["t"]) >= 20:
+            df = pd.DataFrame({
+                "date": pd.to_datetime(res["t"], unit='s'),
+                "open": res["o"],
+                "high": res["h"],
+                "low": res["l"],
+                "close": res["c"],
+                "volume": res["v"]
+            })
+            return df
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(ttl=120, show_spinner=False)
 def get_stock_data(symbol: str):
-    """
-    Lấy dữ liệu nến 60 phiên gần nhất.
-    1. Ưu tiên: TCBS Endpoint
-    2. Fallback: vnstock library
-    """
     sym = symbol.upper().strip()
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    df = None
-
-    # --- CÁCH 1: TCBS API ---
-    try:
-        url = f"https://apipubaws.tcbs.com.vn/stock-insight/v1/stock/bars-long-term?ticker={sym}&type=stock&resolution=D"
-        res = requests.get(url, headers=headers, timeout=5).json()
-        if "data" in res and len(res["data"]) >= 20:
-            df = pd.DataFrame(res["data"])
-            df = df.rename(columns={"tradingDate": "date"})
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values(by="date", ascending=True).reset_index(drop=True)
-            # Chuẩn hóa về đơn vị đồng
-            for col in ["open", "high", "low", "close"]:
-                if df[col].iloc[-1] < 1000:
-                    df[col] = df[col] * 1000
-    except Exception:
-        df = None
-
-    # --- CÁCH 2: FALLBACK QUA VNSTOCK NẾU TCBS THẤT BẠI ---
+    
+    # 1. Thử Yahoo Finance trước
+    df = fetch_from_yahoo(sym)
+    
+    # 2. Fallback sang Entrade nếu Yahoo không phản hồi
     if df is None or df.empty or len(df) < 20:
-        try:
-            from vnstock import Vnstock
-            stock = Vnstock().stock(symbol=sym, source='VCI')
-            end_date = datetime.now().strftime('%Y-%m-%d')
-            start_date = (datetime.now() - timedelta(days=120)).strftime('%Y-%m-%d')
-            raw_df = stock.quote.history(start=start_date, end=end_date)
-            if raw_df is not None and not raw_df.empty:
-                df = raw_df.rename(columns={"time": "date", "match_price": "close"}).copy()
-                df["date"] = pd.to_datetime(df["date"])
-                df = df.sort_values(by="date", ascending=True).reset_index(drop=True)
-                for col in ["open", "high", "low", "close"]:
-                    if df[col].iloc[-1] < 1000:
-                        df[col] = df[col] * 1000
-        except Exception as e:
-            return {"success": False, "error": f"Lỗi truy xuất toàn bộ nguồn dữ liệu: {str(e)}"}
+        df = fetch_from_entrade_backup(sym)
 
-    if df is None or len(df) < 20:
-        return {"success": False, "error": f"Không đủ dữ liệu lịch sử để phân tích cho mã {sym}."}
+    if df is None or df.empty or len(df) < 20:
+        return {"success": False, "error": f"Không thể tải dữ liệu cho mã '{sym}'. Vui lòng kiểm tra lại mã cổ phiếu (ví dụ: HPG, SSI, FPT, VNM)."}
 
-    # --- TÍNH TOÁN CÁC CHỈ BÁO KỸ THUẬT CƠ BẢN ---
+    # Chuẩn hóa về đơn vị đồng (nếu API trả về dạng nghìn đồng < 1000)
+    for col in ["open", "high", "low", "close"]:
+        if df[col].iloc[-1] < 1000:
+            df[col] = df[col] * 1000
+
+    # 3. Tính toán các chỉ số kỹ thuật định lượng
     df["SMA20"] = df["close"].rolling(window=20).mean()
     df["SMA50"] = df["close"].rolling(window=50).mean()
 
@@ -105,17 +124,17 @@ def get_stock_data(symbol: str):
         "sma50": round(float(latest["SMA50"]), 0) if not pd.isna(latest["SMA50"]) else curr_price,
         "support_20": float(df["low"].tail(20).min()),
         "resistance_20": float(df["high"].tail(20).max()),
-        "history_df": df.tail(40)
+        "history_df": df.tail(45)
     }
 
 # ----------------------------------------------------
-# 3. AI REASONING ENGINE (GEMINI 3.6 / FLASH)
+# 3. AI REASONING ENGINE (GEMINI 2.5 FLASH)
 # ----------------------------------------------------
 def get_ai_trading_plan(data: dict) -> dict:
     prompt = f"""
 Bạn là Chuyên gia Tư vấn Đầu tư Chứng khoán Cao cấp (CMT/CFA). Hãy phân tích kỹ thuật và đưa ra khuyến nghị trading kỷ luật, thực chiến cho mã {data['symbol']}.
 
-[DỮ LIỆU THỊ TRƯỜNG HIỆN TẠI]:
+[DỮ LIỆU THỊ TRƯỜNG]:
 - Giá hiện tại: {data['current_price']:,.0f} VNĐ ({data['percent_change']:+.2f}%)
 - Khối lượng phiên: {data['volume']:,} CP | Khối lượng TB 20 phiên: {data['avg_vol_20']:,} CP
 - RSI (14): {data['rsi']}
@@ -160,16 +179,15 @@ Trả về DUY NHẤT 1 JSON Object hợp lệ (không markdown, không bọc ``
         return {"error": f"Không thể xử lý khuyến nghị từ AI: {str(e)}"}
 
 # ----------------------------------------------------
-# 4. GIAO DIỆN STREAMLIT APPLICATION
+# 4. STREAMLIT UI PRESENTATION
 # ----------------------------------------------------
 st.title("📈 Trợ Lý Tư Vấn Xu Hướng Chứng Khoán VN")
-st.caption("Dữ liệu trực tiếp kết hợp thuật toán phân tích kỹ thuật và AI Gemini")
+st.caption("Hệ thống phân tích kỹ thuật định lượng và AI Gemini — Tương thích Cloud quốc tế")
 
-# Sidebar cấu hình
 with st.sidebar:
     st.header("⚙️ Tra Cứu Cổ Phiếu")
     ticker_input = st.text_input("Nhập mã CK (3 chữ cái):", value="HPG").upper().strip()
-    cache_ttl_info = st.info("⏱️ Dữ liệu được cache 120s để tối ưu tốc độ và tránh nghẽn lệnh.")
+    st.info("🌐 Dữ liệu được đồng bộ qua Global Financial Feed (tránh lỗi chặn IP) và cache 120s.")
     submit_btn = st.button("🚀 Phân Tích Kỹ Thuật", type="primary", use_container_width=True)
 
 if ticker_input:
@@ -216,7 +234,7 @@ if ticker_input:
 
         st.markdown("---")
 
-        # Chi tiết xu hướng & Luận điểm
+        # Phân tích xu hướng & Luận điểm
         left_col, right_col = st.columns([1, 1])
 
         with left_col:
@@ -235,7 +253,7 @@ if ticker_input:
                 st.markdown(f"- {c}")
 
         # Biểu đồ nến tương tác Plotly
-        st.subheader("📉 Biểu Đồ Kỹ Thuật 40 Phiên Gần Nhất")
+        st.subheader("📉 Biểu Đồ Kỹ Thuật 45 Phiên Gần Nhất")
         df_hist = market_data["history_df"]
         fig = go.Figure(data=[
             go.Candlestick(
