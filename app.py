@@ -23,7 +23,7 @@ if not api_key:
     st.error("⚠️ Chưa cấu hình GEMINI_API_KEY trong Streamlit Secrets!")
     st.stop()
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
 
 # ----------------------------------------------------
 # 2. DATA ENGINE: GLOBAL-COMPATIBLE INGESTION
